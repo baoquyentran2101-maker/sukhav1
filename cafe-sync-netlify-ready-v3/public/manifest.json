@@ -1,0 +1,7 @@
+{
+  "name": "BQ Café",
+  "short_name": "BQCafe",
+  "start_url": "/",
+  "display": "standalone",
+  "icons": [{ "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" }]
+}
