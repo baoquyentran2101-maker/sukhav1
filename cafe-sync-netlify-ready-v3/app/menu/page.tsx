@@ -1,115 +1,154 @@
 'use client'
 import { useEffect, useMemo, useState } from 'react'
-import { supabase } from '../../lib/supabaseClient'
-import Link from 'next/link'
+import { supabase } from '../../../lib/supabaseClient'
+import { useRouter } from 'next/navigation'
 
-type Group = { id:string, name:string, sort:number }
-type Item  = { id:string, group_id:string, name:string, price:number, is_active:boolean, sort:number }
+type Group = { id:string, name:string }
+type Item  = { id:string, name:string, price:number, group_id:string }
+type OI    = { id:string, item_id:string, qty:number, price:number, amount:number, name?:string }
+type Table = { code:string, status:string }
+type Order = { id:string, is_takeaway:boolean, status:string }
 
-export default function MenuPage(){
+export default function TablePage({ params }:{ params:{ id:string }}) {
+  const router = useRouter()
+  const [table, setTable] = useState<Table>({code:'', status:'empty'})
+  const [orderId, setOrderId] = useState<string>('')
+  const [isTakeaway, setIsTakeaway] = useState<boolean>(false)
+
   const [groups, setGroups] = useState<Group[]>([])
-  const [items, setItems]   = useState<Item[]>([])
-  const [gName, setGName]   = useState('')
-  const [gSort, setGSort]   = useState<number>(0)
-  const [activeGroup, setActiveGroup] = useState<string|undefined>()
+  const [items, setItems] = useState<Item[]>([])
+  const [activeGroup, setActiveGroup] = useState<string>()
+  const [orderItems, setOrderItems] = useState<OI[]>([])
+  const [payMethod, setPayMethod] = useState<'cash'|'bank'>('cash')
+  const total = useMemo(()=> orderItems.reduce((s,i)=>s+Number(i.amount||0),0), [orderItems])
 
-  const [iName, setIName]   = useState('')
-  const [iPrice, setIPrice] = useState<number>(0)
-  const [iSort, setISort]   = useState<number>(0)
+  useEffect(() => {
+    (async () => {
+      // Thông tin bàn + xác định có phải “Mang về” không
+      const { data: t } = await supabase.from('tables').select('code,status,area_id').eq('id', params.id).single()
+      setTable({code: t?.code || '', status: t?.status || 'empty'})
+      // Khu có tên "Mang về"?
+      const { data: area } = await supabase.from('areas').select('name').eq('id', t?.area_id).single()
+      const takeaway = area?.name === 'Mang về'
+      setIsTakeaway(!!takeaway)
+      if (t?.status === 'empty' && !takeaway) await supabase.from('tables').update({ status:'in_use' }).eq('id', params.id)
 
-  async function loadAll(){
-    const { data: gs } = await supabase.from('menu_groups').select('id,name,sort').order('sort, name')
-    setGroups(gs || [])
-    const { data: its } = await supabase.from('menu_items').select('id,group_id,name,price,is_active,sort').order('sort, name')
-    setItems(its || [])
-    if (!activeGroup && gs && gs.length) setActiveGroup(gs[0].id)
+      // Tìm/ tạo order mở
+      let { data: od } = await supabase
+        .from('orders').select('id,is_takeaway,status')
+        .eq('status','open')
+        .eq('is_takeaway', takeaway)
+        .maybeSingle()
+      if (!od) {
+        // Bàn bình thường: gán table_id; Mang về: table_id = null, is_takeaway=true
+        const payload:any = takeaway ? { is_takeaway:true, status:'open' } : { table_id: params.id, is_takeaway:false, status:'open' }
+        const { data: ins } = await supabase.from('orders').insert(payload).select('id,is_takeaway,status').single()
+        od = ins!
+      }
+      setOrderId(od.id)
+
+      // Menu
+      const { data: gs } = await supabase.from('menu_groups').select('id,name').order('sort')
+      setGroups(gs || []); setActiveGroup(gs?.[0]?.id)
+      const { data: it } = await supabase.from('menu_items').select('id,name,price,group_id').eq('is_active',true).order('sort')
+      setItems(it || [])
+
+      await refreshItems(od.id)
+
+      const ch = supabase.channel('rt-order')
+        .on('postgres_changes', { event:'*', schema:'public', table:'order_items', filter:`order_id=eq.${od.id}`}, ()=>refreshItems(od.id))
+        .subscribe()
+      return () => { supabase.removeChannel(ch) }
+    })()
+  }, [params.id])
+
+  async function refreshItems(oid:string){
+    const { data } = await supabase.from('order_items').select('id,item_id,qty,price,amount').eq('order_id', oid)
+    const joined = (data||[]).map(oi => ({ ...oi, name: items.find(i=>i.id===oi.item_id)?.name }))
+    setOrderItems(joined)
   }
-  useEffect(()=>{ loadAll() },[])
 
-  const itemsByGroup = useMemo(() =>
-    items.filter(i=> i.group_id===activeGroup), [items, activeGroup]
-  )
+  async function addItem(itemId:string){
+    const it = items.find(i=>i.id===itemId)!;
+    await supabase.from('order_items').insert({ order_id: orderId, item_id: itemId, qty:1, price: it.price })
+  }
+  async function inc(id:string){ await supabase.rpc('inc_qty',{ p_id:id }) }
+  async function dec(id:string){ await supabase.rpc('dec_qty',{ p_id:id }) }
 
-  async function createGroup(){
-    if(!gName.trim()) return
-    await supabase.from('menu_groups').insert({ name: gName.trim(), sort: gSort })
-    setGName(''); setGSort(0)
-    await loadAll()
+  async function doPay(){
+    if (!orderId) return
+    // Lưu payment
+    await supabase.from('payments').insert({ order_id: orderId, method: payMethod, paid_amount: total })
+    // Đóng order
+    await supabase.from('orders').update({ status:'paid' }).eq('id', orderId)
+    // Trả bàn rỗng nếu không phải Mang về
+    if (!isTakeaway) await supabase.from('tables').update({ status:'empty' }).eq('id', params.id)
+    // Tạo order mới sẵn cho phiên sau (tuỳ ý)
+    if (isTakeaway) {
+      const { data: od } = await supabase.from('orders').insert({ is_takeaway:true, status:'open' }).select('id').single()
+      setOrderId(od!.id)
+    } else {
+      const { data: od } = await supabase.from('orders').insert({ table_id: params.id, is_takeaway:false, status:'open' }).select('id').single()
+      setOrderId(od!.id)
+    }
+    // Xoá list cũ
+    setOrderItems([])
+    alert('Đã thanh toán!')
+    router.push('/history/today')
   }
-  async function renameGroup(id:string, name:string){ await supabase.from('menu_groups').update({ name }).eq('id', id); await loadAll() }
-  async function sortGroup(id:string, sort:number){ await supabase.from('menu_groups').update({ sort }).eq('id', id); await loadAll() }
-  async function deleteGroup(id:string){
-    if (!confirm('Xoá nhóm này? Toàn bộ món thuộc nhóm sẽ bị xoá.')) return
-    await supabase.from('menu_groups').delete().eq('id', id); if (activeGroup===id) setActiveGroup(undefined); await loadAll()
-  }
-
-  async function createItem(){
-    if(!iName.trim() || !activeGroup) return
-    await supabase.from('menu_items').insert({ group_id: activeGroup, name: iName.trim(), price: iPrice||0, sort: iSort, is_active: true })
-    setIName(''); setIPrice(0); setISort(0); await loadAll()
-  }
-  async function updateItemName(id:string, name:string){ await supabase.from('menu_items').update({ name }).eq('id', id); await loadAll() }
-  async function updateItemPrice(id:string, price:number){ await supabase.from('menu_items').update({ price }).eq('id', id); await loadAll() }
-  async function updateItemSort(id:string, sort:number){ await supabase.from('menu_items').update({ sort }).eq('id', id); await loadAll() }
-  async function toggleActive(id:string, is_active:boolean){ await supabase.from('menu_items').update({ is_active }).eq('id', id); await loadAll() }
-  async function moveItemGroup(id:string, group_id:string){ await supabase.from('menu_items').update({ group_id }).eq('id', id); await loadAll() }
-  async function deleteItem(id:string){ if (!confirm('Xoá món này?')) return; await supabase.from('menu_items').delete().eq('id', id); await loadAll() }
 
   return (
-    <div style={{ padding:16, display:'grid', gap:16 }}>
-      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-        <h2>Quản lý Menu</h2>
-        <Link href="/"><button>← Về bàn</button></Link>
+    <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, padding:12 }}>
+      <div>
+        <h3>{isTakeaway ? 'Mang về' : `Bàn ${table.code}`}</h3>
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap', marginBottom:8 }}>
+          {groups.map(g=>(
+            <button key={g.id} onClick={()=>setActiveGroup(g.id)}
+              style={{ padding:'6px 10px', border: activeGroup===g.id?'2px solid #1976d2':'1px solid #ccc', borderRadius:8 }}>
+              {g.name}
+            </button>
+          ))}
+        </div>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(140px,1fr))', gap:8 }}>
+          {items.filter(i=>i.group_id===activeGroup).map(i=>(
+            <button key={i.id} onClick={()=>addItem(i.id)} style={{ border:'1px solid #ddd', borderRadius:8, padding:10, textAlign:'left' }}>
+              <div style={{ fontWeight:600 }}>{i.name}</div>
+              <small>{Number(i.price).toLocaleString()} đ</small>
+            </button>
+          ))}
+        </div>
       </div>
 
-      <section style={{border:'1px solid #eee',borderRadius:8,padding:12}}>
-        <h3>Nhóm món</h3>
-        <div style={{display:'grid',gridTemplateColumns:'1fr auto auto auto',gap:8,alignItems:'center'}}>
-          <input placeholder="Tên nhóm mới…" value={gName} onChange={e=>setGName(e.target.value)} />
-          <input type="number" placeholder="Sort" value={gSort} onChange={e=>setGSort(Number(e.target.value||0))} />
-          <button onClick={createGroup}>Thêm nhóm</button>
-          <span />
-        </div>
-        <div style={{marginTop:12,display:'grid',gap:8}}>
-          {groups.map(g=>(
-            <div key={g.id} style={{display:'grid',gridTemplateColumns:'auto 1fr auto auto auto',gap:8,alignItems:'center'}}>
-              <input type="radio" checked={activeGroup===g.id} onChange={()=>setActiveGroup(g.id)} />
-              <input value={g.name} onChange={e=>renameGroup(g.id, e.target.value)} />
-              <input type="number" value={g.sort} onChange={e=>sortGroup(g.id, Number(e.target.value||0))} style={{width:90}} />
-              <button onClick={()=>deleteGroup(g.id)} style={{color:'#b00020'}}>Xoá</button>
-              <span />
+      <div>
+        <h3>Đơn hiện tại</h3>
+        <div style={{ border:'1px solid #eee', borderRadius:8, padding:8, display:'grid', gap:8, maxHeight:420, overflow:'auto' }}>
+          {orderItems.map(oi=>(
+            <div key={oi.id} style={{ display:'grid', gridTemplateColumns:'1fr auto auto auto', gap:8, alignItems:'center' }}>
+              <div>{oi.name}</div>
+              <div>{Number(oi.price).toLocaleString()}</div>
+              <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                <button onClick={()=>dec(oi.id)}>-</button>
+                <span>{oi.qty}</span>
+                <button onClick={()=>inc(oi.id)}>+</button>
+              </div>
+              <div style={{ textAlign:'right' }}>{Number(oi.amount).toLocaleString()}</div>
             </div>
           ))}
         </div>
-      </section>
 
-      <section style={{border:'1px solid #eee',borderRadius:8,padding:12}}>
-        <h3>Món trong nhóm: <b>{groups.find(g=>g.id===activeGroup)?.name || '—'}</b></h3>
-        <div style={{display:'grid',gridTemplateColumns:'1fr auto auto auto',gap:8,alignItems:'center'}}>
-          <input placeholder="Tên món mới…" value={iName} onChange={e=>setIName(e.target.value)} />
-          <input type="number" placeholder="Giá" value={iPrice} onChange={e=>setIPrice(Number(e.target.value||0))} />
-          <input type="number" placeholder="Sort" value={iSort} onChange={e=>setISort(Number(e.target.value||0))} />
-          <button onClick={createItem} disabled={!activeGroup}>Thêm món</button>
+        <div style={{ marginTop:12 }}>
+          <div style={{marginBottom:8}}>Tổng: <b>{total.toLocaleString()} đ</b></div>
+          <div style={{display:'flex', gap:12, alignItems:'center', marginBottom:8}}>
+            <label><input type="radio" checked={payMethod==='cash'} onChange={()=>setPayMethod('cash')} /> Tiền mặt</label>
+            <label><input type="radio" checked={payMethod==='bank'} onChange={()=>setPayMethod('bank')} /> Chuyển khoản</label>
+          </div>
+          <button onClick={doPay} disabled={total<=0}>Thanh toán</button>
         </div>
 
-        <div style={{marginTop:12,display:'grid',gap:8}}>
-          {itemsByGroup.map(it=>(
-            <div key={it.id} style={{display:'grid',gridTemplateColumns:'1fr 110px 90px 130px auto auto',gap:8,alignItems:'center'}}>
-              <input value={it.name} onChange={e=>updateItemName(it.id, e.target.value)} />
-              <input type="number" value={it.price} onChange={e=>updateItemPrice(it.id, Number(e.target.value||0))} />
-              <input type="number" value={it.sort} onChange={e=>updateItemSort(it.id, Number(e.target.value||0))} />
-              <select value={it.group_id} onChange={e=>moveItemGroup(it.id, e.target.value)}>
-                {groups.map(g=>(<option key={g.id} value={g.id}>{g.name}</option>))}
-              </select>
-              <label style={{display:'flex',alignItems:'center',gap:6}}>
-                <input type="checkbox" checked={it.is_active} onChange={e=>toggleActive(it.id, e.target.checked)} />
-                <span>Hiển thị</span>
-              </label>
-              <button onClick={()=>deleteItem(it.id)} style={{color:'#b00020'}}>Xoá</button>
-            </div>
-          ))}
+        <div style={{ marginTop:8 }}>
+          <a href={isTakeaway ? '/' : `/area/${params.id}`}>{'←'} Quay lại</a>
         </div>
-      </section>
+      </div>
     </div>
   )
 }
